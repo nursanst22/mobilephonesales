@@ -1,0 +1,290 @@
+---
+title: "mobile sales"
+author: "nursa"
+date: "2026-05-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+```{r}
+
+# 1. PANGGIL SEMUA LIBRARY DI SINI
+library(tidyverse)  # Untuk manipulasi data (dplyr, readr, stringr) dan visualisasi (ggplot2)
+library(lubridate)  # Untuk mengolah data tanggal
+library(rsample)    # Untuk data splitting (training & testing)
+library(recipes)    # Untuk pre-processing data
+library(parsnip)    # Untuk spesifikasi model machine learning
+library(workflows)  # Untuk menggabungkan recipe dan model
+library(yardstick)  # Untuk evaluasi model (RMSE, R-Squared)
+library(vip)        # Untuk visualisasi Variable Importance
+```
+```{r}
+# Membaca data
+datasales <- read_csv("mobile_sales_data.csv")
+
+# Melihat sekilas dimensi dan tipe data awal
+glimpse(datasales)
+```
+```{r}
+datasales_clean <- datasales %>%
+  mutate(
+    # Mengurus Tanggal & Menghitung Target Prediksi
+    Inward_Date = ymd(`Inward Date`),
+    Dispatch_Date = ymd(`Dispatch Date`),
+    Days_to_Sell = as.numeric(Dispatch_Date - Inward_Date),
+    
+    # Membersihkan RAM
+    RAM_GB = as.numeric(str_replace_all(RAM, "GB", "")),
+    
+    # Membersihkan ROM (Konversi TB ke GB jika ada)
+    ROM_GB = case_when(
+      str_detect(ROM, "TB") ~ as.numeric(str_replace_all(ROM, "TB", "")) * 1024,
+      TRUE ~ as.numeric(str_replace_all(ROM, "GB", ""))
+    ),
+    
+    # Membersihkan SSD (Mengubah "N/A" jadi 0, Konversi TB ke GB)
+    SSD_GB = case_when(
+      SSD == "N/A" ~ 0,
+      str_detect(SSD, "TB") ~ as.numeric(str_replace_all(SSD, "TB", "")) * 1024,
+      TRUE ~ as.numeric(str_replace_all(SSD, "GB", ""))
+    )
+  ) %>%
+  # Membuang kolom yang tidak relevan untuk pemodelan ML
+  select(
+    -`Product Specification`, -`Product Code`, -`Customer Name`, 
+    -`Inward Date`, -`Dispatch Date`, -RAM, -ROM, -SSD
+  ) %>%
+  drop_na(Days_to_Sell) # Membuang baris yang tanggalnya gagal dihitung
+
+# Cek hasil pembersihan
+glimpse(datasales_clean)
+```
+
+```{r}
+# EDA 1: Distribusi Harga berdasarkan Kapasitas RAM
+ggplot(datasales_clean, aes(x = factor(RAM_GB), y = Price, fill = Product)) +
+  geom_boxplot(alpha = 0.8) +
+  facet_wrap(~Product, scales = "free_y") +
+  scale_fill_manual(values = c("Laptop" = "#2c3e50", "Mobile Phone" = "#e74c3c")) +
+  theme_minimal() +
+  labs(
+    title = "Distribusi Harga Berdasarkan Kapasitas RAM",
+    x = "Kapasitas RAM (GB)", 
+    y = "Harga",
+    fill = "Kategori"
+  )
+
+# EDA 2: Volume Transaksi per Region
+ggplot(datasales_clean, aes(x = fct_infreq(Region), fill = Region)) +
+  geom_bar() +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  labs(
+    title = "Volume Transaksi Berdasarkan Wilayah (Region)",
+    x = "Region", 
+    y = "Total Transaksi"
+  )
+```
+```{r}
+set.seed(123) # Menjaga agar pembagian data selalu sama setiap kali di-run
+
+data_split <- initial_split(datasales_clean, prop = 0.8, strata = Days_to_Sell)
+data_train <- training(data_split)
+data_test  <- testing(data_split)
+
+cat("Jumlah Data Latih:", nrow(data_train), "\n")
+cat("Jumlah Data Uji:", nrow(data_test), "\n")
+```
+```{r}
+# 1. Blueprint Pre-processing (Recipe)
+ml_recipe <- recipe(Days_to_Sell ~ Product + Brand + Price + Region + RAM_GB + ROM_GB, 
+                    data = data_train) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+# 2. Spesifikasi Random Forest
+rf_spec <- rand_forest(trees = 100) %>%
+  set_mode("regression") %>%
+  set_engine("ranger", importance = "impurity")
+
+# 3. Spesifikasi XGBoost
+xgb_spec <- boost_tree(trees = 100) %>%
+  set_mode("regression") %>%
+  set_engine("xgboost")
+
+# 4. Penggabungan ke Workflow
+rf_workflow <- workflow() %>%
+  add_recipe(ml_recipe) %>%
+  add_model(rf_spec)
+
+xgb_workflow <- workflow() %>%
+  add_recipe(ml_recipe) %>%
+  add_model(xgb_spec)
+```
+
+```{r}
+cat("Melatih Random Forest...\n")
+rf_fit <- fit(rf_workflow, data = data_train)
+
+cat("Melatih XGBoost...\n")
+xgb_fit <- fit(xgb_workflow, data = data_train)
+
+cat("Pelatihan selesai!\n")
+```
+```{r}
+# 1. Prediksi ke Data Test
+results <- data_test %>%
+  select(Days_to_Sell) %>%
+  bind_cols(
+    predict(rf_fit, new_data = data_test) %>% rename(.pred_rf = .pred),
+    predict(xgb_fit, new_data = data_test) %>% rename(.pred_xgb = .pred)
+  )
+
+# 2. Hitung Metrik Error (RMSE & R-Squared)
+eval_metrics <- metric_set(rmse, rsq)
+
+rf_eval <- eval_metrics(results, truth = Days_to_Sell, estimate = .pred_rf) %>%
+  mutate(Model = "Random Forest")
+
+xgb_eval <- eval_metrics(results, truth = Days_to_Sell, estimate = .pred_xgb) %>%
+  mutate(Model = "XGBoost")
+
+# Tampilkan perbandingan
+bind_rows(rf_eval, xgb_eval) %>%
+  select(Model, .metric, .estimate) %>%
+  arrange(.metric, .estimate)
+
+# 3. Visualisasi Variable Importance (Faktor Penentu)
+rf_fit %>%
+  extract_fit_parsnip() %>%
+  vip(num_features = 10, geom = "col", mapping = aes(fill = Importance)) +
+  scale_fill_viridis_c(option = "plasma") +
+  theme_minimal() +
+  labs(
+    title = "Faktor Penentu Waktu Terjual (Days to Sell)",
+    subtitle = "Berdasarkan Model Random Forest",
+    x = "Tingkat Kepentingan",
+    y = "Fitur"
+  )
+```
+
+```{r}
+# Panggil library readr jika belum
+library(readr)
+
+# Menyimpan model ke dalam file .rds (R Data Serialization)
+write_rds(rf_fit, "model_rf_final.rds")
+
+# Menyimpan data bersih (opsional, untuk visualisasi di dashboard nanti)
+write_csv(datasales_clean, "datasales_clean.csv")
+
+cat("Model berhasil disimpan!")
+```
+```{r}
+# 1. PANGGIL LIBRARY
+library(shiny)
+library(bslib)
+library(tidyverse)
+library(parsnip)
+library(workflows)
+library(readr)
+
+# 2. MUAT MODEL YANG SUDAH DISIMPAN
+# (Pastikan file model_rf_final.rds ada di folder yang sama dengan app.R)
+model_prediksi <- read_rds("model_rf_final.rds")
+
+# 3. BANGUN USER INTERFACE (UI)
+ui <- page_sidebar(
+  title = "TechSales Navigator 🚀",
+  theme = bs_theme(bootswatch = "flatly", primary = "#2c3e50"),
+  
+  # Bagian Kiri: Formulir Input
+  sidebar = sidebar(
+    title = "Masukkan Spesifikasi Barang",
+    selectInput("product", "Kategori Produk", choices = c("Laptop", "Mobile Phone")),
+    selectInput("brand", "Brand", choices = c("Apple", "Samsung", "Dell", "HP", "Lenovo", "Oppo", "Sony", "Microsoft", "Motorola")),
+    selectInput("region", "Region Penjualan", choices = c("North", "South", "East", "West", "Central")),
+    numericInput("ram", "Kapasitas RAM (GB)", value = 8, min = 4, max = 64),
+    numericInput("rom", "Kapasitas ROM/Storage (GB)", value = 256, min = 64, max = 2048),
+    
+    # PERUBAHAN UI: Menggunakan USD. Default $800, kelipatan $50
+    numericInput("price", "Harga Jual (USD $)", value = 800, min = 50, step = 50),
+    
+    actionButton("hitung", "Prediksi Waktu Terjual!", class = "btn-primary", width = "100%")
+  ),
+  
+  # Bagian Kanan: Hasil Output
+  card(
+    card_header("Hasil Prediksi Machine Learning"),
+    card_body(
+      h4("Estimasi Lama Waktu Terjual:"),
+      h1(textOutput("hasil_prediksi"), style = "color: #e74c3c; font-weight: bold;"),
+      p("hari dari tanggal barang masuk ke gudang."),
+      hr(),
+      h5("Rekomendasi Sistem:"),
+      textOutput("rekomendasi_teks")
+    )
+  )
+)
+
+# 4. BANGUN LOGIKA SERVER (OTAK APLIKASI)
+server <- function(input, output, session) {
+  
+  observeEvent(input$hitung, {
+    
+    # --- LOGIKA MANUSIAWI (DATA VALIDATION) ---
+    # Batas maksimal harga ditetapkan $5.000 USD (sekitar Rp 80 Juta)
+    batas_harga_wajar <- 5000 
+    
+    if (input$price > batas_harga_wajar) {
+      output$hasil_prediksi <- renderText({ "Tak Terhingga" })
+      output$rekomendasi_teks <- renderText({
+        "❌ PERINGATAN SISTEM: Harga melebihi batas $5,000 USD. Barang ultra-premium ini tidak relevan dengan model prediksi tren pasar standar kami."
+      })
+      return()
+    }
+    # ------------------------------------------
+
+    # --- DATA ENGINEERING (SCALING) ---
+    # Konversi USD ke skala data asli (asumsi data asli INR, dikali ~83)
+    harga_untuk_ai <- input$price * 83
+    
+    data_baru <- tibble(
+      Product = input$product,
+      Brand = input$brand,
+      Region = input$region,
+      RAM_GB = input$ram,
+      ROM_GB = input$rom,
+      Price = harga_untuk_ai # Menggunakan harga hasil konversi
+    )
+    
+    prediksi <- predict(model_prediksi, new_data = data_baru)
+    hari_terjual <- round(prediksi$.pred)
+    
+    output$hasil_prediksi <- renderText({
+      paste(hari_terjual)
+    })
+    
+    output$rekomendasi_teks <- renderText({
+      if (hari_terjual > 45) {
+        "⚠️ Barang ini diprediksi akan mengendap cukup lama. Pertimbangkan untuk memberikan diskon, promo bundling, atau kurangi stok restock berikutnya."
+      } else if (hari_terjual >= 14 && hari_terjual <= 45) {
+        "✅ Perputaran barang berada di tingkat normal. Pertahankan strategi harga saat ini."
+      } else {
+        "🔥 Barang ini sangat cepat laku (Fast Moving)! Pastikan rantai pasok (supply chain) aman agar tidak terjadi kehabisan stok."
+      }
+    })
+    
+  })
+}
+
+# 5. JALANKAN APLIKASI
+shinyApp(ui, server)
+```                
+
